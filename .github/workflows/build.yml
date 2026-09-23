@@ -143,8 +143,12 @@ jobs:
           cd "$RUNNER_TEMP"
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o up.img.gz "$UP_URL"
           ls -lh up.img.gz
-          gunzip -c up.img.gz > up.img
-          ls -lh up.img
+          # 注意：OpenWrt 镜像尾部带 append-metadata，gunzip 会报 "trailing garbage"
+          # 并返回退出码 2，在 set -e 下会误判为失败 —— 忽略退出码，改用大小校验兜底
+          gunzip -c up.img.gz > up.img 2>/dev/null || true
+          SZIMG=$(stat -c %s up.img)
+          echo "解压后镜像: $SZIMG 字节"
+          if [ "$SZIMG" -lt 16777216 ]; then echo "❌ 解压后镜像不足 16MiB，异常"; exit 1; fi
           echo "===== 上游官方镜像分区表（首个分区起点应为 32768 扇区 = 16MiB）====="
           fdisk -l up.img 2>/dev/null | head -20 || true
           sfdisk -d up.img 2>/dev/null | head -10 || true
