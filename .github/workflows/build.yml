@@ -202,12 +202,18 @@ jobs:
           # 为什么必须手写网络配置？
           # iStoreOS 的 base-files/etc/board.d/02_network 里压根没有
           # xunlong,orangepi-r1-plus 这个 case（全文只认 nanopi-r2s / r4s / r4se），
-          # 于是 R1 Plus 掉进 `*)` 兜底分支 → ucidef_set_interface_lan 'eth0'
-          # 结果：LAN=eth0，且**根本不生成 WAN 接口**。
-          # 而 ImmortalWrt 官方是 lan_wan 'eth1' 'eth0'（LAN=USB 网卡），
-          # 两边完全相反 —— 这就是为什么换了固件后同一个网口突然不通。
-          # 解法：不依赖发行版自动识别，直接写一份确定的配置，并且
-          #       把两个网口都桥接进 LAN，用户插哪个口都能进后台。
+          # 于是 R1 Plus 掉进 `*)` 兜底分支 → 只生成 LAN=eth0，**根本不生成 WAN**。
+          #
+          # ⚠️ 血的教训（v4 实测回归）：
+          # 曾经为了"插哪个口都能进后台"，把 eth0+eth1 都桥接进 br-lan。
+          # 结果光猫和电脑落在**同一个二层广播域**，光猫的 DHCP 直接应答了电脑，
+          # 用户拿到的是上游光猫发的地址 —— 路由器完全没有路由该有的样子。
+          # 结论：两个网口必须分工（WAN/LAN 分离），桥接在这里是错的。
+          #
+          # 物理对应（据 Orange Pi 官方手册接口图 + 实测资料）：
+          #   eth0 = 原生 RTL8211E，**远离** Type-C 电源口的那个口 → WAN（接光猫）
+          #   eth1 = USB  RTL8153B，**靠近** Type-C 电源口的那个口 → LAN（接电脑）
+          # 板上有 "WAN LED" / "LAN LED" 丝印可直接对照。
           # ─────────────────────────────────────────────────────────────
           cat > "$FILES/etc/config/network" <<'EOF'
           config interface 'loopback'
@@ -220,156 +226,44 @@ jobs:
           	option ula_prefix 'fdc7:c3f2:a41b::/48'
           	option packet_steering '1'
 
-          config device 'brlan'
-          	option name 'br-lan'
-          	option type 'bridge'
-          	list ports 'eth0'
-          	list ports 'eth1'
-
+          # LAN：USB 网卡（靠近 Type-C 电源口的那个口）—— 接电脑
           config interface 'lan'
-          	option device 'br-lan'
+          	option device 'eth1'
           	option proto 'static'
           	option ipaddr '__LAN_IP__'
           	option netmask '255.255.255.0'
           	option ip6assign '60'
 
-          # 备用地址：万一用户还在用 192.168.1.x 网段，也能进后台
-          config interface 'lan2'
-          	option device '@lan'
-          	option proto 'static'
-          	option ipaddr '192.168.1.1'
-          	option netmask '255.255.255.0'
+          # WAN：原生千兆网卡（远离 Type-C 电源口的那个口）—— 接光猫
+          # 光猫在路由模式（有 DHCP 服务器）→ 直接 DHCP 拿地址，配好 NAT 即可上网
+          config interface 'wan'
+          	option device 'eth0'
+          	option proto 'dhcp'
           EOF
           sed -i "s/__LAN_IP__/${{ inputs.lan_ip }}/" "$FILES/etc/config/network"
 
-          cat > "$FILES/etc/config/firewall" <<'EOF'
-          config defaults
-          	option syn_flood '1'
-          	option input 'ACCEPT'
-          	option output 'ACCEPT'
-          	option forward 'ACCEPT'
-
-          config zone
-          	option name 'lan'
-          	list network 'lan'
-          	list network 'lan2'
-          	option input 'ACCEPT'
-          	option output 'ACCEPT'
-          	option forward 'ACCEPT'
-          EOF
-
-          cat > "$FILES/etc/config/dhcp" <<'EOF'
-          config dnsmasq
-          	option domainneeded '1'
-          	option localise_queries '1'
-          	option rebind_protection '1'
-          	option local '/lan/'
-          	option domain 'lan'
-          	option expandhosts '1'
-          	option cachesize '1000'
-          	option authoritative '1'
-          	option readethers '1'
-          	option leasefile '/tmp/dhcp.leases'
-          	option localservice '1'
-          	option ednspacket_max '1232'
-
-          config dhcp 'lan'
-          	option interface 'lan'
-          	option start '100'
-          	option limit '150'
-          	option leasetime '12h'
-          	option dhcpv4 'server'
-
-          config dhcp 'lan2'
-          	option interface 'lan2'
-          	option start '100'
-          	option limit '150'
-          	option leasetime '12h'
-          	option dhcpv4 'server'
-          EOF
-
-          # 启动完成指示：状态灯进入心跳模式，方便肉眼判断系统是否真的进了用户空间
-          mkdir -p "$FILES/etc"
-          cat > "$FILES/etc/rc.local" <<'EOF'
-          # 启动完成后把状态灯切成心跳闪烁
-          # —— 看到有规律地一闪一闪 = 系统已完整启动，不是卡在内核阶段
-          sleep 8
-          for d in /sys/class/leds/*; do
-            case "$(basename "$d")" in
-              *status*|*green*|*heartbeat*|*act*)
-                echo heartbeat > "$d/trigger" 2>/dev/null
-                ;;
-            esac
-          done
-          exit 0
-          EOF
-          chmod +x "$FILES/etc/rc.local"
-
           # ─────────────────────────────────────────────────────────────
-          # 网络自适应：让固件自己搞定网口，不要求用户做任何判断
+          # 防火墙 / DHCP：一律沿用 iStoreOS 系统自带的默认值，**不覆盖**。
           #
-          # 堵两个坑：
-          # 1) 网口名不一定叫 eth0/eth1 —— 按实际探测到的物理以太口重写网桥成员，
-          #    不依赖写死的名字，免得换个内核命名规则就全盘失效。
-          # 2) 网口 2 其实是 USB 网卡（RTL8153B），USB 枚举比 SoC 慢得多，
-          #    开机那一刻它可能压根还没出现，netifd 会直接跳过、且之后永不补回来。
-          #    所以再挂一个后台守护，启动后 3 分钟里持续把新出现的口加进网桥。
+          # iStoreOS 的默认 firewall 本来就是标准双口路由器规则
+          # （lan zone 含 lan、wan zone 含 wan 且 masq=1、forwarding lan→wan），
+          # 默认 dhcp 也已经给 lan 配好了 server —— 只要我们按标准名字把
+          # lan / wan 两个接口定义出来，这些默认规则就正好生效。
+          # 自己覆盖反而会丢掉 iStoreOS 自带的那套规则，得不偿失。
+          #
+          # 这就是为什么上面只动了 /etc/config/network 一个文件：
+          # 它不是"多余的定制"，而是补上 iStoreOS 源码里**确实缺失**的
+          # R1 Plus 接口定义（02_network 里没有这个机型的 case）。
           # ─────────────────────────────────────────────────────────────
-          cat > "$FILES/etc/uci-defaults/99-fix-lan" <<'EOF'
-          #!/bin/sh
-          # 列出所有真实以太网卡（虚拟接口没有 device 链接）
-          list_eth() {
-            for d in /sys/class/net/*; do
-              n=$(basename "$d")
-              [ "$n" = "lo" ] && continue
-              [ -e "$d/device" ] || continue
-              echo "$n"
-            done | sort
-          }
 
-          PORTS=$(list_eth)
-          logger -t fix-lan "detected ethernet ports: $PORTS"
-
-          if [ -n "$PORTS" ]; then
-            uci -q delete network.brlan.ports
-            for p in $PORTS; do
-              uci add_list network.brlan.ports="$p"
-            done
-            uci set network.lan.device='br-lan'
-            uci commit network
-            logger -t fix-lan "br-lan ports rewritten to: $PORTS"
-          fi
-
-          # 后台守护：USB 网卡可能晚到，持续补进网桥
-          cat > /etc/lan-port-watchdog.sh <<'WEOF'
-          #!/bin/sh
-          prev=""
-          i=0
-          while [ $i -lt 36 ]; do
-            cur=$(for d in /sys/class/net/*; do
-                    n=$(basename "$d")
-                    [ "$n" = "lo" ] && continue
-                    [ -e "$d/device" ] || continue
-                    echo "$n"
-                  done | sort)
-            if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
-              logger -t lan-watchdog "ports now: $cur"
-              uci -q delete network.brlan.ports
-              for p in $cur; do uci add_list network.brlan.ports="$p"; done
-              uci commit network
-              /etc/init.d/network reload >/dev/null 2>&1
-            fi
-            prev="$cur"
-            i=$((i+1))
-            sleep 5
-          done
-          WEOF
-          chmod +x /etc/lan-port-watchdog.sh
-          nohup /etc/lan-port-watchdog.sh >/dev/null 2>&1 &
-
-          exit 0
-          EOF
-          chmod +x "$FILES/etc/uci-defaults/99-fix-lan"
+          # 注：这里**不再**覆盖 /etc/rc.local，也不再往 files 里塞任何
+          # uci-defaults 自适应脚本 —— 保持固件与 iStoreOS 原版一致。
+          # 唯一改动就是上面那份 /etc/config/network。
+          #
+          # 为什么删掉了之前的"网口自适应 + 网桥看门狗"：
+          # 那套东西是为了"插哪个口都能进后台"而把两个网口桥接起来，
+          # 结果把 WAN 侧和 LAN 侧并成了同一个二层域，光猫的 DHCP 直接
+          # 应答了 LAN 上的电脑 —— 反而制造了故障。网口就该老老实实分工。
 
           if [ -n "${{ inputs.root_password }}" ]; then
             HASH=$(openssl passwd -6 "${{ inputs.root_password }}")
