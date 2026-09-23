@@ -176,56 +176,62 @@ jobs:
           done
           echo "✅ 已从官方固件切片得到 $NEED（32KiB~16MiB 完整 bootloader 区）"
 
-      - name: Compose package list (继承 iStoreOS 默认集 + 追加)
+      - name: Compose package list
         id: pkgs
         run: |
           # ─────────────────────────────────────────────────────────────
-          # ⚠️ 这里踩过一个极具迷惑性的大坑，改之前务必先读懂：
+          # 两条血的教训，改这个列表前务必先读懂：
           #
-          # iStoreOS 的 ImageBuilder 解压目录里带了一份 .config，其中用
-          # CONFIG_PACKAGE_xxx=y 预置了**整套官方默认包**，包括：
-          #   uhttpd / uhttpd-mod-ubus / luci-ssl / luci-mod-admin-full
-          #   luci-mod-network / -status / -system / luci-app-firewall
-          #   istoreos-files / quickstart / luci-app-store ...
+          # 【教训 1】管理页是「可选包」，不写就没有。
+          #   iStoreOS 的 IB 只保证 profile 的 DEFAULT_PACKAGES
+          #   （内核 / dnsmasq / firewall4 / dropbear / kmod-usb-net-rtl8152 …）。
+          #   uhttpd 和整个 luci-mod-* 都**不在其中**，必须显式列出。
+          #   漏了会怎样：固件能开机、能正常发 IP，但 80 端口无人监听，
+          #   管理页打不开 —— 而且构建全程绿灯、不报任何错，刷完卡才发现。
           #
-          # 而 `make image` 一旦收到命令行 PACKAGES=...，这套预置会被
-          # **整个替换掉**（是替换，不是追加！）。结果就是固件里
-          # 内核在、dnsmasq 在（能开机、能发 IP），但 uhttpd 没了 ——
-          # 80 端口没有任何进程监听，浏览器自然进不去管理页。
+          # 【教训 2】别想着「从 IB 的 .config 提取官方包列表」。
+          #   .config 里的 CONFIG_PACKAGE_xxx=y 绝大多数是**编译开关**：
+          #     TAR_XZ / ATH_DFS / B43_PHY_G / dnsmasq_full_auth /
+          #     u-boot-nanopi-r4s-rk3399 / trusted-firmware-a-rk3588 …
+          #   这些根本不是可安装的包名，塞进 PACKAGES= 只会得到一片
+          #   "(no such package)"，然后 package_install 报 Error 56，
+          #   整个构建挂掉。实测踩过，995 个"包"里大半是这种。
           #
-          # 症状极具误导性：网络看着完全正常，就是打不开后台。
-          # 实测证据：这样打出来的固件 manifest 只有 205 个包，
-          # 官方同 target 是 940 个，`/usr/sbin/uhttpd` 直接不存在。
-          #
-          # 修法：先把 .config 里的默认包集**提取出来当底座**，再往上追加。
+          # 结论：要装什么，就在下面老老实实写清楚。
+          # 以下包名已逐个对照官方 iStoreOS manifest 核实过存在性。
           # ─────────────────────────────────────────────────────────────
-          BASE=$(sed -n 's/^CONFIG_PACKAGE_\([A-Za-z0-9_.+-]*\)=y$/\1/p' "$IB_DIR/.config" 2>/dev/null | sort -u | tr '\n' ' ')
-          BASE_N=$(echo $BASE | wc -w)
-          echo "从 IB .config 提取到默认包：$BASE_N 个"
-          echo "前 15 个：$(echo $BASE | cut -d' ' -f1-15)"
 
-          # 兜底：万一日后上游改了 .config 结构导致提取不到东西，
-          # 至少保证「管理页必需包」显式装上，绝不产出进不去后台的固件。
-          if [ "$BASE_N" -lt 30 ]; then
-            echo "⚠️ 提取到的包太少（<30），启用兜底必需清单"
-            BASE="uhttpd uhttpd-mod-ubus luci-ssl luci luci-light luci-mod-admin-full luci-mod-network luci-mod-status luci-mod-system luci-app-firewall istoreos-files quickstart luci-app-quickstart"
-          fi
+          # ── 管理界面底座：这几行决定能不能进后台，动它要格外小心 ──
+          P="uhttpd uhttpd-mod-ubus rpcd-mod-luci"
+          P="$P luci luci-light luci-mod-admin-full"
+          P="$P luci-app-firewall luci-i18n-firewall-zh-cn"
+          P="$P luci-proto-ppp luci-i18n-base-zh-cn"
 
-          P=""
           if [ "${{ inputs.with_gui_extras }}" = "true" ]; then
-            P="$P luci-app-store luci-app-quickstart luci-i18n-quickstart-zh-cn"
+            # iStoreOS 自家门面：首页快速设置 + 应用商店
+            P="$P istoreos-files quickstart luci-app-quickstart luci-i18n-quickstart-zh-cn"
+            P="$P luci-app-store luci-lib-taskd taskd"
+            # 实用工具
+            P="$P luci-app-package-manager luci-i18n-package-manager-zh-cn"
             P="$P luci-app-diskman luci-i18n-diskman-zh-cn"
-            P="$P luci-theme-argon luci-i18n-argon-config-zh-cn luci-i18n-base-zh-cn"
+            P="$P luci-app-ttyd luci-i18n-ttyd-zh-cn"
+            P="$P luci-app-wol luci-i18n-wol-zh-cn"
+            P="$P luci-app-upnp luci-i18n-upnp-zh-cn"
+            # argon 主题
+            P="$P luci-theme-argon luci-app-argon-config"
+            P="$P luci-i18n-argon-zh-cn luci-i18n-argon-config-zh-cn"
           fi
-          if [ "${{ inputs.include_docker }}" = "true" ]; then
-            P="$P docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn"
-          fi
-          P="$P ${{ inputs.extra_packages }}"
 
-          ALL=$(echo "$BASE $P" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
-          echo "packages=$ALL" >> "$GITHUB_OUTPUT"
-          echo "最终 PACKAGES 共 $(echo $ALL | wc -w) 个包"
-          echo "其中额外追加：$P"
+          if [ "${{ inputs.include_docker }}" = "true" ]; then
+            P="$P docker dockerd docker-compose"
+            P="$P luci-app-dockerman luci-i18n-dockerman-zh-cn"
+          fi
+
+          P="$P ${{ inputs.extra_packages }}"
+          P=$(echo "$P" | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          echo "packages=$P" >> "$GITHUB_OUTPUT"
+          echo "最终 PACKAGES 共 $(echo $P | wc -w) 个顶层包（依赖由 apk 自动解析）："
+          echo "$P" | tr ' ' '\n' | sed 's/^/  - /'
 
       - name: Prepare files overlay (LAN IP / root password / board network fix)
         run: |
