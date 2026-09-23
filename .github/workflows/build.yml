@@ -193,19 +193,117 @@ jobs:
           echo "packages=$P" >> "$GITHUB_OUTPUT"
           echo "最终 PACKAGES: $P"
 
-      - name: Prepare files overlay (LAN IP / root password)
+      - name: Prepare files overlay (LAN IP / root password / board network fix)
         run: |
           FILES="${{ github.workspace }}/files"
-          mkdir -p "$FILES/etc/uci-defaults"
-          cat > "$FILES/etc/uci-defaults/99-custom-lan" <<'EOF'
-          #!/bin/sh
-          # 首启把 LAN 地址改成本仓库 workflow 里指定的值
-          uci set network.lan.ipaddr='__LAN_IP__'
-          uci commit network
+          mkdir -p "$FILES/etc/config" "$FILES/etc/uci-defaults"
+
+          # ─────────────────────────────────────────────────────────────
+          # 为什么必须手写网络配置？
+          # iStoreOS 的 base-files/etc/board.d/02_network 里压根没有
+          # xunlong,orangepi-r1-plus 这个 case（全文只认 nanopi-r2s / r4s / r4se），
+          # 于是 R1 Plus 掉进 `*)` 兜底分支 → ucidef_set_interface_lan 'eth0'
+          # 结果：LAN=eth0，且**根本不生成 WAN 接口**。
+          # 而 ImmortalWrt 官方是 lan_wan 'eth1' 'eth0'（LAN=USB 网卡），
+          # 两边完全相反 —— 这就是为什么换了固件后同一个网口突然不通。
+          # 解法：不依赖发行版自动识别，直接写一份确定的配置，并且
+          #       把两个网口都桥接进 LAN，用户插哪个口都能进后台。
+          # ─────────────────────────────────────────────────────────────
+          cat > "$FILES/etc/config/network" <<'EOF'
+          config interface 'loopback'
+          	option device 'lo'
+          	option proto 'static'
+          	option ipaddr '127.0.0.1'
+          	option netmask '255.0.0.0'
+
+          config globals 'globals'
+          	option ula_prefix 'fdc7:c3f2:a41b::/48'
+          	option packet_steering '1'
+
+          config device
+          	option name 'br-lan'
+          	option type 'bridge'
+          	list ports 'eth0'
+          	list ports 'eth1'
+
+          config interface 'lan'
+          	option device 'br-lan'
+          	option proto 'static'
+          	option ipaddr '__LAN_IP__'
+          	option netmask '255.255.255.0'
+          	option ip6assign '60'
+
+          # 备用地址：万一用户还在用 192.168.1.x 网段，也能进后台
+          config interface 'lan2'
+          	option device '@lan'
+          	option proto 'static'
+          	option ipaddr '192.168.1.1'
+          	option netmask '255.255.255.0'
+          EOF
+          sed -i "s/__LAN_IP__/${{ inputs.lan_ip }}/" "$FILES/etc/config/network"
+
+          cat > "$FILES/etc/config/firewall" <<'EOF'
+          config defaults
+          	option syn_flood '1'
+          	option input 'ACCEPT'
+          	option output 'ACCEPT'
+          	option forward 'ACCEPT'
+
+          config zone
+          	option name 'lan'
+          	list network 'lan'
+          	list network 'lan2'
+          	option input 'ACCEPT'
+          	option output 'ACCEPT'
+          	option forward 'ACCEPT'
+          EOF
+
+          cat > "$FILES/etc/config/dhcp" <<'EOF'
+          config dnsmasq
+          	option domainneeded '1'
+          	option localise_queries '1'
+          	option rebind_protection '1'
+          	option local '/lan/'
+          	option domain 'lan'
+          	option expandhosts '1'
+          	option cachesize '1000'
+          	option authoritative '1'
+          	option readethers '1'
+          	option leasefile '/tmp/dhcp.leases'
+          	option localservice '1'
+          	option ednspacket_max '1232'
+
+          config dhcp 'lan'
+          	option interface 'lan'
+          	option start '100'
+          	option limit '150'
+          	option leasetime '12h'
+          	option dhcpv4 'server'
+
+          config dhcp 'lan2'
+          	option interface 'lan2'
+          	option start '100'
+          	option limit '150'
+          	option leasetime '12h'
+          	option dhcpv4 'server'
+          EOF
+
+          # 启动完成指示：状态灯进入心跳模式，方便肉眼判断系统是否真的进了用户空间
+          mkdir -p "$FILES/etc"
+          cat > "$FILES/etc/rc.local" <<'EOF'
+          # 启动完成后把状态灯切成心跳闪烁
+          # —— 看到有规律地一闪一闪 = 系统已完整启动，不是卡在内核阶段
+          sleep 8
+          for d in /sys/class/leds/*; do
+            case "$(basename "$d")" in
+              *status*|*green*|*heartbeat*|*act*)
+                echo heartbeat > "$d/trigger" 2>/dev/null
+                ;;
+            esac
+          done
           exit 0
           EOF
-          sed -i "s/__LAN_IP__/${{ inputs.lan_ip }}/" "$FILES/etc/uci-defaults/99-custom-lan"
-          chmod +x "$FILES/etc/uci-defaults/99-custom-lan"
+          chmod +x "$FILES/etc/rc.local"
 
           if [ -n "${{ inputs.root_password }}" ]; then
             HASH=$(openssl passwd -6 "${{ inputs.root_password }}")
