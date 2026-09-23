@@ -220,7 +220,7 @@ jobs:
           	option ula_prefix 'fdc7:c3f2:a41b::/48'
           	option packet_steering '1'
 
-          config device
+          config device 'brlan'
           	option name 'br-lan'
           	option type 'bridge'
           	list ports 'eth0'
@@ -304,6 +304,72 @@ jobs:
           exit 0
           EOF
           chmod +x "$FILES/etc/rc.local"
+
+          # ─────────────────────────────────────────────────────────────
+          # 网络自适应：让固件自己搞定网口，不要求用户做任何判断
+          #
+          # 堵两个坑：
+          # 1) 网口名不一定叫 eth0/eth1 —— 按实际探测到的物理以太口重写网桥成员，
+          #    不依赖写死的名字，免得换个内核命名规则就全盘失效。
+          # 2) 网口 2 其实是 USB 网卡（RTL8153B），USB 枚举比 SoC 慢得多，
+          #    开机那一刻它可能压根还没出现，netifd 会直接跳过、且之后永不补回来。
+          #    所以再挂一个后台守护，启动后 3 分钟里持续把新出现的口加进网桥。
+          # ─────────────────────────────────────────────────────────────
+          cat > "$FILES/etc/uci-defaults/99-fix-lan" <<'EOF'
+          #!/bin/sh
+          # 列出所有真实以太网卡（虚拟接口没有 device 链接）
+          list_eth() {
+            for d in /sys/class/net/*; do
+              n=$(basename "$d")
+              [ "$n" = "lo" ] && continue
+              [ -e "$d/device" ] || continue
+              echo "$n"
+            done | sort
+          }
+
+          PORTS=$(list_eth)
+          logger -t fix-lan "detected ethernet ports: $PORTS"
+
+          if [ -n "$PORTS" ]; then
+            uci -q delete network.brlan.ports
+            for p in $PORTS; do
+              uci add_list network.brlan.ports="$p"
+            done
+            uci set network.lan.device='br-lan'
+            uci commit network
+            logger -t fix-lan "br-lan ports rewritten to: $PORTS"
+          fi
+
+          # 后台守护：USB 网卡可能晚到，持续补进网桥
+          cat > /etc/lan-port-watchdog.sh <<'WEOF'
+          #!/bin/sh
+          prev=""
+          i=0
+          while [ $i -lt 36 ]; do
+            cur=$(for d in /sys/class/net/*; do
+                    n=$(basename "$d")
+                    [ "$n" = "lo" ] && continue
+                    [ -e "$d/device" ] || continue
+                    echo "$n"
+                  done | sort)
+            if [ -n "$cur" ] && [ "$cur" != "$prev" ]; then
+              logger -t lan-watchdog "ports now: $cur"
+              uci -q delete network.brlan.ports
+              for p in $cur; do uci add_list network.brlan.ports="$p"; done
+              uci commit network
+              /etc/init.d/network reload >/dev/null 2>&1
+            fi
+            prev="$cur"
+            i=$((i+1))
+            sleep 5
+          done
+          WEOF
+          chmod +x /etc/lan-port-watchdog.sh
+          nohup /etc/lan-port-watchdog.sh >/dev/null 2>&1 &
+
+          exit 0
+          EOF
+          chmod +x "$FILES/etc/uci-defaults/99-fix-lan"
 
           if [ -n "${{ inputs.root_password }}" ]; then
             HASH=$(openssl passwd -6 "${{ inputs.root_password }}")
