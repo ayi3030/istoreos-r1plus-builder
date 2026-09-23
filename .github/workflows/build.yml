@@ -4,13 +4,14 @@ name: Build iStoreOS for Orange Pi R1 Plus
 # 用 iStoreOS 官方 ImageBuilder 为 Xunlong Orange Pi R1 Plus 打包固件。
 # 不编译源码，几分钟出包。
 #
-# 想每月自动重建（上游 IB 更新后自动跟着刷新），把下面三行的注释去掉：
-#   schedule:
-#     - cron: '17 3 1 * *'
+# 每月自动重建已启用：每月 1 号 UTC 03:17（北京时间 11:17）自动跑一次，
+# 上游 iStoreOS ImageBuilder 更新后会自动跟着刷新。
 # 注意：自动构建只会更新 Artifacts，不会自动刷进你的路由器。
 # ─────────────────────────────────────────────────────────────
 
 on:
+  schedule:
+    - cron: '17 3 1 * *'
   workflow_dispatch:
     inputs:
       profile:
