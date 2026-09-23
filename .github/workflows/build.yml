@@ -140,24 +140,24 @@ jobs:
           FILES="${{ github.workspace }}/files"
           mkdir -p "$FILES/etc/uci-defaults"
           cat > "$FILES/etc/uci-defaults/99-custom-lan" <<'EOF'
-#!/bin/sh
-# 首启把 LAN 地址改成本仓库 workflow 里指定的值
-uci set network.lan.ipaddr='__LAN_IP__'
-uci commit network
-exit 0
-EOF
+          #!/bin/sh
+          # 首启把 LAN 地址改成本仓库 workflow 里指定的值
+          uci set network.lan.ipaddr='__LAN_IP__'
+          uci commit network
+          exit 0
+          EOF
           sed -i "s/__LAN_IP__/${{ inputs.lan_ip }}/" "$FILES/etc/uci-defaults/99-custom-lan"
           chmod +x "$FILES/etc/uci-defaults/99-custom-lan"
 
           if [ -n "${{ inputs.root_password }}" ]; then
             HASH=$(openssl passwd -6 "${{ inputs.root_password }}")
             cat > "$FILES/etc/shadow" <<EOF
-root:${HASH}:1:0:99999:7:::
-daemon:*:0:0:99999:7:::
-ftp:*:0:0:99999:7:::
-network:*:0:0:99999:7:::
-nobody:*:0:0:99999:7:::
-EOF
+          root:${HASH}:1:0:99999:7:::
+          daemon:*:0:0:99999:7:::
+          ftp:*:0:0:99999:7:::
+          network:*:0:0:99999:7:::
+          nobody:*:0:0:99999:7:::
+          EOF
             chmod 600 "$FILES/etc/shadow"
             echo "已写入 root 密码哈希（明文不落盘、不进日志）"
           fi
