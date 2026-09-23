@@ -132,25 +132,38 @@ jobs:
             echo "✅ IB 自带 $NEED，无需补充"
             exit 0
           fi
-          echo "⚠️ IB 缺少 $NEED —— iStoreOS 官方 IB 没为 R1 Plus 打包 u-boot"
-          echo "    改从 ImmortalWrt 官方 IB 提取（同为 rockchip/armv8 的 u-boot bootloader blob，与发行版无关）"
+          echo "⚠️ IB 缺少 $NEED —— iStoreOS 官方 IB 没为 R1 Plus 打包设备级 u-boot"
+          echo "===== 打印 IB 里引用 -u-boot-rockchip.bin 的打包规则（用于确认 seek 偏移） ====="
+          grep -rn -- "-u-boot-rockchip" "$IB_DIR/target" "$IB_DIR/include" "$IB_DIR/scripts" 2>/dev/null | head -20
+          echo "===== 该规则上下文 ====="
+          RULE=$(grep -rln -- "-u-boot-rockchip" "$IB_DIR/target" "$IB_DIR/include" 2>/dev/null | head -1)
+          if [ -n "$RULE" ]; then grep -n -B6 -A6 -- "-u-boot-rockchip" "$RULE" | head -60; fi
+          echo ""
+          echo "从 ImmortalWrt 官方 IB 取 SOC 级 bootloader 组件（idbloader + trust）后组装"
           cd "$RUNNER_TEMP"
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o up-ib.tar.zst \
             "https://downloads.immortalwrt.org/releases/24.10.6/targets/rockchip/armv8/immortalwrt-imagebuilder-24.10.6-rockchip-armv8.Linux-x86_64.tar.zst"
           ls -lh up-ib.tar.zst
           mkdir -p upstage
-          tar --zstd -xf up-ib.tar.zst -C upstage --wildcards '*/staging_dir/*/image/*.bin' 2>/dev/null || true
-          echo "===== 上游 IB 里找到的候选 ====="
-          find upstage -type f -name '*.bin' 2>/dev/null | head -40
-          SRC=$(find upstage -type f -name "$NEED" | head -1)
-          if [ -n "$SRC" ]; then
-            cp "$SRC" "$IMGDIR/$NEED"
-            ls -lh "$IMGDIR/$NEED"
-            echo "✅ 已从上游 IB 补入 $NEED"
-          else
-            echo "❌ 上游 IB 里也没有 $NEED，构建无法继续"
-            exit 1
+          tar --zstd -xf up-ib.tar.zst -C upstage \
+            --wildcards '*/image/rk3328-idbloader.bin' '*/image/rk3328-trust.bin' 2>/dev/null || true
+          IDBL=$(find upstage -name 'rk3328-idbloader.bin' 2>/dev/null | head -1)
+          TRUST=$(find upstage -name 'rk3328-trust.bin' 2>/dev/null | head -1)
+          echo "idbloader: $IDBL"
+          echo "trust    : $TRUST"
+          for C in "$IDBL" "$TRUST"; do if [ -f "$C" ]; then ls -lh "$C"; else echo "(缺失) $C"; fi; done
+          if [ -z "$IDBL" ] || [ -z "$TRUST" ]; then
+            echo "❌ 上游 IB 里取不到 idbloader/trust 组件"; exit 1
           fi
+          # 组装：镜像布局为 idbloader@sector64(32KB)、trust@sector16384(8MB)。
+          # 该文件后续会被 dd 以 seek=64 写入，故文件内 idbloader 放起点、
+          # trust 放在 (8MB - 32KB) = 8355839 字节处。
+          OUT="$IMGDIR/$NEED"
+          dd if="$IDBL" of="$OUT" bs=512 conv=notrunc 2>&1 | tail -2
+          truncate -s 8355839 "$OUT"
+          cat "$TRUST" >> "$OUT"
+          ls -lh "$OUT"
+          echo "✅ 已从 SOC 级组件组装出 $NEED"
 
       - name: Compose package list
         id: pkgs
