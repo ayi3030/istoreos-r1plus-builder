@@ -1,0 +1,198 @@
+name: Build iStoreOS for Orange Pi R1 Plus
+
+# ─────────────────────────────────────────────────────────────
+# 用 iStoreOS 官方 ImageBuilder 为 Xunlong Orange Pi R1 Plus 打包固件。
+# 不编译源码，几分钟出包。
+#
+# 想每月自动重建（上游 IB 更新后自动跟着刷新），把下面三行的注释去掉：
+#   schedule:
+#     - cron: '17 3 1 * *'
+# 注意：自动构建只会更新 Artifacts，不会自动刷进你的路由器。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: '设备 profile（R1 Plus 非 LTS；LTS 版网卡是 yt8531c，别选错）'
+        required: true
+        default: 'xunlong_orangepi-r1-plus'
+        type: choice
+        options:
+          - xunlong_orangepi-r1-plus
+          - xunlong_orangepi-r1-plus-lts
+      lan_ip:
+        description: '管理地址（你现在用 10.0.0.1；iStoreOS 默认是 192.168.100.1）'
+        required: true
+        default: '10.0.0.1'
+      rootfs_partsize:
+        description: 'rootfs 分区大小(MB)。64G 卡建议 4096；剩余空间刷完后另建第三分区挂 /mnt/data'
+        required: true
+        default: '4096'
+      include_docker:
+        description: '集成 Docker（1GB 内存请谨慎，见 README）'
+        required: false
+        default: false
+        type: boolean
+      with_gui_extras:
+        description: '集成 iStore 商店 / quickstart 首页 / 磁盘管理 / argon 主题'
+        required: false
+        default: true
+        type: boolean
+      extra_packages:
+        description: '额外软件包（空格分隔；写错包名会让构建失败）'
+        required: false
+        default: ''
+      root_password:
+        description: '可选。给固件预置 root 密码（会在 runner 内做 sha512 加盐，明文不出现在日志里）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  IB_BASE: https://fw.koolcenter.com/iStoreOS/ib/rk3xxx
+  IB_FILE: istoreos-imagebuilder-rockchip-armv8.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libncurses-dev zlib1g-dev gawk git gettext \
+            libssl-dev xsltproc rsync wget curl file unzip tar zstd xz-utils \
+            python3 python3-setuptools openssl
+
+      - name: Download official ImageBuilder + verify checksum
+        working-directory: ${{ runner.temp }}
+        run: |
+          cd "$RUNNER_TEMP"
+          echo "== 下载 $IB_FILE =="
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$IB_FILE" "$IB_BASE/$IB_FILE"
+          curl -fL -o sha256sums "$IB_BASE/sha256sums"
+          echo "== 官方 sha256sums 内容 =="
+          cat sha256sums
+          echo "== 校验 =="
+          grep imagebuilder sha256sums | sha256sum -c -
+          ls -lh "$IB_FILE"
+
+      - name: Extract ImageBuilder
+        run: |
+          cd "$RUNNER_TEMP"
+          tar --zstd -xf "$IB_FILE"
+          IB_DIR=$(ls -d "$RUNNER_TEMP"/istoreos-imagebuilder-*/ | head -1)
+          IB_DIR="${IB_DIR%/}"
+          echo "IB_DIR=$IB_DIR" >> "$GITHUB_ENV"
+          echo "解压到: $IB_DIR"
+          echo "== IB 基础版本 =="
+          cat "$IB_DIR/version.buildinfo" 2>/dev/null || true
+          head -3 "$IB_DIR/repositories.conf" 2>/dev/null || true
+
+      - name: Verify target profile exists (fail fast)
+        run: |
+          cd "$IB_DIR"
+          make info > ib-info.txt 2>&1 || true
+          echo "===== 目标 profile 检查：${{ inputs.profile }} ====="
+          if grep -q "^${{ inputs.profile }}:" ib-info.txt; then
+            grep -A3 "^${{ inputs.profile }}:" ib-info.txt
+            echo "✅ profile 存在"
+            grep -E "^(Current Target|Target|Subtarget):" ib-info.txt || true
+          else
+            echo "❌ 该 ImageBuilder 里没有 ${{ inputs.profile }}"
+            echo "可用 profile 列表："
+            grep -E "^[a-z0-9_-]+:" ib-info.txt | head -120
+            exit 1
+          fi
+
+      - name: Compose package list
+        id: pkgs
+        run: |
+          P=""
+          if [ "${{ inputs.with_gui_extras }}" = "true" ]; then
+            P="$P luci-app-store luci-app-quickstart luci-i18n-quickstart-zh-cn"
+            P="$P luci-app-diskman luci-i18n-diskman-zh-cn"
+            P="$P luci-theme-argon luci-i18n-argon-config-zh-cn luci-i18n-base-zh-cn"
+          fi
+          if [ "${{ inputs.include_docker }}" = "true" ]; then
+            P="$P docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn"
+          fi
+          P="$P ${{ inputs.extra_packages }}"
+          P=$(echo "$P" | tr -s ' ' | sed 's/^ *//;s/ *$//')
+          echo "packages=$P" >> "$GITHUB_OUTPUT"
+          echo "最终 PACKAGES: $P"
+
+      - name: Prepare files overlay (LAN IP / root password)
+        run: |
+          FILES="${{ github.workspace }}/files"
+          mkdir -p "$FILES/etc/uci-defaults"
+          cat > "$FILES/etc/uci-defaults/99-custom-lan" <<'EOF'
+#!/bin/sh
+# 首启把 LAN 地址改成本仓库 workflow 里指定的值
+uci set network.lan.ipaddr='__LAN_IP__'
+uci commit network
+exit 0
+EOF
+          sed -i "s/__LAN_IP__/${{ inputs.lan_ip }}/" "$FILES/etc/uci-defaults/99-custom-lan"
+          chmod +x "$FILES/etc/uci-defaults/99-custom-lan"
+
+          if [ -n "${{ inputs.root_password }}" ]; then
+            HASH=$(openssl passwd -6 "${{ inputs.root_password }}")
+            cat > "$FILES/etc/shadow" <<EOF
+root:${HASH}:1:0:99999:7:::
+daemon:*:0:0:99999:7:::
+ftp:*:0:0:99999:7:::
+network:*:0:0:99999:7:::
+nobody:*:0:0:99999:7:::
+EOF
+            chmod 600 "$FILES/etc/shadow"
+            echo "已写入 root 密码哈希（明文不落盘、不进日志）"
+          fi
+          echo "== files 树 =="
+          find "$FILES" -type f -exec echo {} \;
+
+      - name: Build image
+        run: |
+          cd "$IB_DIR"
+          make -j$(nproc) image \
+            PROFILE="${{ inputs.profile }}" \
+            PACKAGES="${{ steps.pkgs.outputs.packages }}" \
+            FILES="${{ github.workspace }}/files" \
+            ROOTFS_PARTSIZE="${{ inputs.rootfs_partsize }}" \
+            CONFIG_TARGET_ROOTFS_PARTSIZE="${{ inputs.rootfs_partsize }}"
+
+      - name: Collect artifacts
+        run: |
+          OUT="${{ github.workspace }}/out"
+          BIN="$IB_DIR/bin/targets/rockchip/armv8"
+          mkdir -p "$OUT"
+          cp "$BIN"/*.img.gz "$OUT/" 2>/dev/null || true
+          cp "$BIN"/*.manifest "$OUT/" 2>/dev/null || true
+          cp "$BIN"/*config.buildinfo "$OUT/" 2>/dev/null || true
+          cp "$BIN"/sha256sums "$OUT/" 2>/dev/null || true
+          echo "===== 产物 ====="
+          ls -lh "$OUT"
+          (cd "$OUT" && sha256sum * 2>/dev/null | tee SHA256SUMS.txt)
+          if [ -z "$(ls -A "$OUT")" ]; then
+            echo "❌ 没有生成任何镜像"; exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: istoreos-${{ inputs.profile }}-${{ github.run_number }}
+          path: out/
+          retention-days: 30
